@@ -2,6 +2,8 @@
 #include "position.h"
 #include "movegen.h"
 #include "search.h"
+#include "eval.h"
+#include "nnue.h"
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -66,6 +68,9 @@ void uci_loop() {
     init_zobrist();
     init_bitboards();
 
+    // Try to load default NNUE weights
+    NNUE::init("nnue.bin");
+
     Position pos;
     std::thread search_thread;
 
@@ -80,7 +85,19 @@ void uci_loop() {
         if (token == "uci") {
             std::cout << "id name " << ENGINE_NAME << " " << ENGINE_VERSION << std::endl;
             std::cout << "id author OpencodeChess" << std::endl;
+            std::cout << "option name EvalFile type string default <empty>" << std::endl;
             std::cout << "uciok" << std::endl;
+        } else if (token == "setoption") {
+            std::string opt, val;
+            iss >> opt >> opt; // "name" -> option name
+            if (opt == "EvalFile") {
+                iss >> val >> val; // "value" -> filename
+                if (val == "<empty>" || val.empty()) {
+                    NNUE::loaded = false;
+                } else {
+                    NNUE::init(val.c_str());
+                }
+            }
         } else if (token == "isready") {
             std::cout << "readyok" << std::endl;
         } else if (token == "ucinewgame") {

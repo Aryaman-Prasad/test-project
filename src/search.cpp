@@ -7,6 +7,7 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <thread>
 
 std::atomic<bool> SearchAborted{false};
 TranspositionTable TT;
@@ -75,7 +76,7 @@ static void sort_moves(MoveList& list, const Position& pos, int ply, Move tt_mov
 static Value quiescence(Position& pos, Value alpha, Value beta, Depth depth) {
     if (SearchAborted) return 0;
 
-    Value stand_pat = evaluate(pos);
+    Value stand_pat = evaluate_hce(pos);
 
     if (stand_pat >= beta)
         return beta;
@@ -208,6 +209,14 @@ static Value alpha_beta(Position& pos, Value alpha, Value beta, Depth depth, Dep
         }
     }
 
+    // Razor pruning: if static eval is far below alpha at low depth, 
+    // replace with a quiescence search to verify.
+    if (depth <= 2 && !in_check && static_eval + 300 + 100 * depth < alpha) {
+        Value q = quiescence(pos, alpha, beta, 0);
+        if (SearchAborted) return 0;
+        return q;
+    }
+
     MoveList list;
     generate_moves(pos, list);
 
@@ -294,31 +303,55 @@ void search(Position& pos, SearchLimits& limits, SearchInfo& info) {
     TT.new_search();
 
     auto start_time = std::chrono::steady_clock::now();
-        Nodes = 0;
+    Nodes = 0;
     info.nodes = 0;
     info.completed = false;
 
     Depth max_depth = limits.depth;
     if (max_depth > MAX_PLY) max_depth = MAX_PLY;
 
-    int64_t time_limit = limits.movetime;
-    if (time_limit == 0 && limits.time_left[WHITE] > 0) {
+    // --- Time management ---
+    int64_t optimal_time = limits.movetime;
+    int64_t max_time = limits.movetime;
+
+    if (optimal_time == 0 && limits.time_left[WHITE] > 0) {
         Color stm = pos.side_to_move();
-        time_limit = limits.time_left[stm] / 40;
-        if (limits.inc[stm] > 0)
-            time_limit += limits.inc[stm] * 3 / 4;
-        if (time_limit > limits.time_left[stm] / 2)
-            time_limit = limits.time_left[stm] / 2;
-        if (time_limit < 10) time_limit = 10;
+        int64_t time_rem = limits.time_left[stm];
+        int64_t inc = limits.inc[stm];
+        int moves_to_go = (limits.movestogo > 0) ? limits.movestogo : 40;
+
+        optimal_time = time_rem / moves_to_go + inc * 3 / 4;
+        if (optimal_time > time_rem / 3)
+            optimal_time = time_rem / 3;
+        max_time = time_rem / 2;
+        if (optimal_time < 10) optimal_time = 10;
+        if (max_time < optimal_time) max_time = optimal_time * 2;
     }
-    if (time_limit == 0) time_limit = 60000;
-    int64_t deadline = time_limit;
+    if (optimal_time == 0) {
+        optimal_time = 60000;
+        max_time = 120000;
+    }
+
+    // Watchdog timer: sets SearchAborted at max_time for hard cutoff
+    bool timer_armed = (max_time > 0);
+    if (timer_armed) {
+        std::thread([max_time]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(max_time));
+            SearchAborted = true;
+        }).detach();
+    }
 
     Move best_move = MOVE_NONE;
     Value best_score = VALUE_NONE;
     Value prev_score = VALUE_NONE;
+    Move best_move_prev = MOVE_NONE;
+    int stable_count = 0;
 
     for (Depth d = 1; d <= max_depth; ++d) {
+        // Pre-search check: stop if the watchdog already fired
+        if (SearchAborted)
+            break;
+
         Move iter_best = MOVE_NONE;
         Value score;
 
@@ -409,13 +442,20 @@ void search(Position& pos, SearchLimits& limits, SearchInfo& info) {
                   << " nodes " << info.nodes << " time " << elapsed
                   << " pv" << pv_str << std::endl;
 
-        if (time_limit > 0 && elapsed >= deadline)
-            break;
+        // Track best move stability
+        if (iter_best == best_move_prev)
+            stable_count++;
+        else {
+            stable_count = 0;
+            best_move_prev = iter_best;
+        }
 
+        // Stop on mate
         if (score > VALUE_MATE_IN_MAX_PLY || score < -VALUE_MATE_IN_MAX_PLY)
             break;
 
-        if (time_limit > 0 && elapsed * 3 > time_limit)
+        // Stop early if the best move is stable and we've used enough time
+        if (d >= 2 && optimal_time > 0 && elapsed >= optimal_time && stable_count >= 2)
             break;
     }
 

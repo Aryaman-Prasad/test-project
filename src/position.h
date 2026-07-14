@@ -2,6 +2,7 @@
 #define POSITION_H
 
 #include "bitboard.h"
+#include "nnue.h"
 #include <vector>
 #include <string>
 
@@ -25,6 +26,7 @@ struct StateInfo {
     Square en_passant_sq;
     int    halfmove_clock;
     Piece  captured_piece;
+    int16_t nnue_accumulator[2][NNUE::FT_N];
 };
 
 // --------------------------------------------------------------------------
@@ -79,10 +81,13 @@ public:
     std::string fen() const;
     static const std::string START_FEN;
 
+    int16_t nnue_accumulator[2][NNUE::FT_N];
+
 private:
     void set_piece_raw(Color c, PieceType pt, Square sq);
     void remove_piece(Color c, PieceType pt, Square sq);
     void move_piece(Color c, PieceType pt, Square from, Square to);
+    void update_nnue_accumulator(Move m, Piece moved_piece, const struct StateInfo& st);
 
     Bitboard piece_bb[2][6];
     Bitboard occ[2];

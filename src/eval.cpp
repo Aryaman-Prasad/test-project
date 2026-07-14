@@ -1,4 +1,5 @@
 #include "eval.h"
+#include "nnue.h"
 
 constexpr Value PawnValue   = 100;
 constexpr Value KnightValue = 320;
@@ -120,7 +121,11 @@ static Value pawn_structure(const Position& pos, Color c) {
     return score;
 }
 
-Value evaluate(const Position& pos) {
+bool eval_is_nnue() {
+    return NNUE::loaded;
+}
+
+Value evaluate_hce(const Position& pos) {
     Color stm = pos.side_to_move();
     int phase = game_phase(pos);
     int mg_phase = std::min(phase, 24);
@@ -191,5 +196,11 @@ Value evaluate(const Position& pos) {
     Value total = (mg_total * mg_phase + eg_total * eg_phase) / 24;
     total += mat[WHITE] - mat[BLACK];
 
-    return stm == WHITE ? total + Tempo : total - Tempo;
+    return stm == WHITE ? total + Tempo : -total + Tempo;
+}
+
+Value evaluate(const Position& pos) {
+    if (NNUE::loaded)
+        return NNUE::evaluate(pos);
+    return evaluate_hce(pos);
 }

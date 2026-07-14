@@ -1,6 +1,10 @@
 #include "position.h"
+#include "nnue.h"
 #include <sstream>
 #include <cctype>
+#include <cstring>
+#include <algorithm>
+#include <cstring>
 
 // --------------------------------------------------------------------------
 // Zobrist keys
@@ -89,6 +93,9 @@ void Position::clear() {
     rule50 = 0;
     fullmove_number_ = 1;
     state_stack.clear();
+    if (NNUE::loaded)
+        for (int p = 0; p < 2; ++p)
+            std::memcpy(nnue_accumulator[p], NNUE::ft_bias, sizeof(NNUE::ft_bias));
 }
 
 void Position::set_piece(Color c, PieceType pt, Square sq) {
@@ -139,6 +146,9 @@ void Position::set_fen(const std::string& fen) {
 
     ss >> token;
     if (!token.empty()) fullmove_number_ = std::stoi(token);
+
+    if (NNUE::loaded)
+        NNUE::compute_full_accumulator(*this, nnue_accumulator);
 }
 
 Key Position::compute_hash() const {
@@ -316,6 +326,81 @@ Value Position::see(Move m) const {
 }
 
 // --------------------------------------------------------------------------
+// NNUE accumulator incremental update
+// --------------------------------------------------------------------------
+static void apply_nnue_delta(int16_t* acc, Square ks, int delta, Piece pc, Square sq) {
+    if (pc == PIECE_NONE) return;
+    int pc_idx = int(pc);
+    int fi = (ks * 64 + sq) * 12 + pc_idx;
+    for (int i = 0; i < NNUE::FT_N; ++i)
+        acc[i] = NNUE::clamp_i16(int32_t(acc[i]) + delta * int32_t(NNUE::ft_weights[fi][i]));
+}
+
+void Position::update_nnue_accumulator(Move m, Piece moved_piece, const StateInfo& st) {
+    if (!NNUE::loaded) return;
+
+    Square from = move_from(m);
+    Square to = move_to(m);
+    int type = move_type(m);
+    Color us = color_of(moved_piece);
+    PieceType pt = type_of(moved_piece);
+
+    Square wk = king_sq(WHITE);
+    Square bk = king_sq(BLACK);
+
+    bool wk_moved = (us == WHITE) && (pt == KING);
+    bool bk_moved = (us == BLACK) && (pt == KING);
+
+    // Collect removals and additions
+    struct { int delta; Piece pc; Square sq; } deltas[6];
+    int nd = 0;
+
+    // Moving piece
+    deltas[nd++] = {-1, moved_piece, from};
+    deltas[nd++] = {+1, board[to], to};
+
+    // Captured piece
+    Square cap_sq = to;
+    if (type == EN_PASSANT)
+        cap_sq = Square(int(to) + (us == WHITE ? -8 : 8));
+    if (st.captured_piece != PIECE_NONE)
+        deltas[nd++] = {-1, st.captured_piece, cap_sq};
+
+    // Castling rook
+    if (type == CASTLING) {
+        Square rf = SQ_NONE, rt = SQ_NONE;
+        if (to == G1) { rf = H1; rt = F1; }
+        else if (to == C1) { rf = A1; rt = D1; }
+        else if (to == G8) { rf = H8; rt = F8; }
+        else if (to == C8) { rf = A8; rt = D8; }
+        if (rf != SQ_NONE) {
+            deltas[nd++] = {-1, make_piece(us, ROOK), rf};
+            deltas[nd++] = {+1, make_piece(us, ROOK), rt};
+        }
+    }
+
+    // Apply to each perspective separately
+    if (wk_moved)
+        NNUE::compute_persp_accumulator(*this, 0, nnue_accumulator[0]);
+
+    if (bk_moved)
+        NNUE::compute_persp_accumulator(*this, 1, nnue_accumulator[1]);
+
+    // Apply deltas to perspectives whose king did NOT move
+    for (int p = 0; p < 2; ++p) {
+        bool king_moved = (p == 0) ? wk_moved : bk_moved;
+        if (king_moved) continue;
+
+        Square ks = (p == 0) ? wk : bk;
+        Piece my_king = (p == 0) ? W_KING : B_KING;
+        for (int i = 0; i < nd; ++i) {
+            if (deltas[i].pc == my_king) continue;
+            apply_nnue_delta(nnue_accumulator[p], ks, deltas[i].delta, deltas[i].pc, deltas[i].sq);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // make_move / unmake_move
 // --------------------------------------------------------------------------
 void Position::make_move(Move m) {
@@ -336,6 +421,8 @@ void Position::make_move(Move m) {
     st.en_passant_sq   = ep_sq;
     st.halfmove_clock  = rule50;
     st.captured_piece  = board[to];
+    if (NNUE::loaded)
+        std::memcpy(st.nnue_accumulator, nnue_accumulator, sizeof(nnue_accumulator));
 
     // EP: capture square is behind the target
     if (type == EN_PASSANT) {
@@ -380,6 +467,9 @@ void Position::make_move(Move m) {
         move_piece(us, pt, from, to);
     }
 
+    // --- Update NNUE accumulator ---
+    update_nnue_accumulator(m, moved_piece, state_stack.back());
+
     // --- Set EP for double pawn push ---
     if (pt == PAWN && type != PROMOTION) {
         int diff = int(to) - int(from);
@@ -421,6 +511,10 @@ void Position::unmake_move(Move m) {
     rule50          = st.halfmove_clock;
     if (them == WHITE) --fullmove_number_;
 
+    // Restore NNUE accumulator
+    if (NNUE::loaded)
+        std::memcpy(nnue_accumulator, st.nnue_accumulator, sizeof(nnue_accumulator));
+
     // Undo board changes
     if (type == CASTLING) {
         move_piece(us, KING, to, from);
@@ -457,6 +551,8 @@ void Position::make_null_move() {
     st.en_passant_sq   = ep_sq;
     st.halfmove_clock  = rule50;
     st.captured_piece  = PIECE_NONE;
+    if (NNUE::loaded)
+        std::memcpy(st.nnue_accumulator, nnue_accumulator, sizeof(nnue_accumulator));
     state_stack.push_back(st);
 
     ep_sq = SQ_NONE;
